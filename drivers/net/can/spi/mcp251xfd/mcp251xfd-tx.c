@@ -209,17 +209,46 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 	unsigned int frame_len;
 	u8 tx_head;
 	int err;
+	u32 intf, fifosta, tefsta, tefcon, fifocon;
+	const u8 fifo_nr = tx_ring->fifo_nr;
 
 	if (can_dev_dropped_skb(ndev, skb))
+	{
+		netdev_info(priv->ndev, "OK");
 		return NETDEV_TX_OK;
-
-	if (mcp251xfd_tx_busy(priv, tx_ring) ||
-	    mcp251xfd_work_busy(&priv->tx_work))
+	}
+	if (mcp251xfd_tx_busy(priv, tx_ring))
+	{
+		netdev_info(priv->ndev, "BUSY");
 		return NETDEV_TX_BUSY;
+	}
+	netdev_info(priv->ndev, "XMIT");
+	if (priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK)
+	{
+		regmap_update_bits(priv->map_reg,
+						MCP251XFD_REG_FIFOCON(priv->tx->fifo_nr),
+						MCP251XFD_REG_FIFOCON_TXAT_MASK | MCP251XFD_REG_FIFOCON_FRESET,
+						FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK,
+				 	 	MCP251XFD_REG_FIFOCON_TXAT_ONE_SHOT) | MCP251XFD_REG_FIFOCON_FRESET);
+		regmap_update_bits(priv->map_reg,
+					MCP251XFD_REG_TEFCON,
+					MCP251XFD_REG_TEFCON_FRESET,
+					MCP251XFD_REG_TEFCON_FRESET);
+		do{
+			regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
+		}while(fifocon & MCP251XFD_REG_FIFOCON_FRESET);
+		do{
+			regmap_read(priv->map_reg, MCP251XFD_REG_TEFCON, &tefcon);
+		}while(tefcon & MCP251XFD_REG_TEFCON_FRESET);
 
+		priv->tef->head = 0;
+		priv->tef->tail = 0;
+
+		tx_ring->head = 0;
+		tx_ring->tail = 0;
+	}
 	tx_obj = mcp251xfd_get_tx_obj_next(tx_ring);
 	mcp251xfd_tx_obj_from_skb(priv, tx_obj, skb, tx_ring->head);
-
 	/* Stop queue if we occupy the complete TX FIFO */
 	tx_head = mcp251xfd_get_tx_head(tx_ring);
 	tx_ring->head++;
@@ -227,18 +256,34 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 		netif_stop_queue(ndev);
 
 	frame_len = can_skb_get_frame_len(skb);
+	
+	netdev_info(ndev,
+		"TX head=%u tail=%u free=%u frame_len=%u\n",
+		tx_ring->head,
+		tx_ring->tail,
+		mcp251xfd_get_tx_free(tx_ring),
+		frame_len);
+
 	err = can_put_echo_skb(skb, ndev, tx_head, frame_len);
 	if (!err)
+	{
 		netdev_sent_queue(priv->ndev, frame_len);
+	}
+	// regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
+    // regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
+	// regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
+    // netdev_info(priv->ndev, "After send INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
+    // netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x\n", fifo_nr, fifosta);
 
 	err = mcp251xfd_tx_obj_write(priv, tx_obj);
-	if (err == -EBUSY) {
-		netif_stop_queue(ndev);
-		priv->tx_work_obj = tx_obj;
-		queue_work(priv->wq, &priv->tx_work);
-	} else if (err) {
-		mcp251xfd_tx_failure_drop(priv, tx_ring, err);
+	if (err)
+	{
+		goto out_err;
 	}
+	return NETDEV_TX_OK;
+
+ out_err:
+	netdev_err(priv->ndev, "ERROR in %s: %d\n", __func__, err);
 
 	return NETDEV_TX_OK;
 }

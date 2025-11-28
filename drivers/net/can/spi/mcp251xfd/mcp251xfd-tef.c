@@ -305,19 +305,22 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 {
 	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
 	const u8 fifo_nr = tx_ring->fifo_nr;
-	int err;
+	int err, i;
 	unsigned int frame_len;
-	u8 chip_tx_tail, chip_tef_tail;
-	u32 tef_tail;
+	u8 chip_tx_tail, chip_tef_tail, tx_head;
+	u32 tef_tail, val;
 	u32 intf, fifosta, tefsta, fifocon, tefcon;
 
-	can_free_echo_skb(priv->ndev, fifo_nr, NULL);
-	// regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
-    // regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
-    // netdev_info(priv->ndev, "Start INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
-    // /* Dump FIFO status for all TX/RX FIFOs */
-    // regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
-    // netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x\n", fifo_nr, fifosta);
+	can_free_echo_skb(priv->ndev, tx_head, &frame_len);
+	regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
+    regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
+
+    netdev_info(priv->ndev, "Start INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
+
+    /* Dump FIFO status for all TX/RX FIFOs */
+    regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
+	regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
+    netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x con=0x%08x\n", fifo_nr, fifosta, fifocon);
 
 	err = regmap_update_bits(priv->map_reg,
 							MCP251XFD_REG_FIFOSTA(fifo_nr),
@@ -328,9 +331,9 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 		return err;
 	}
 	tef_tail = mcp251xfd_get_tef_tail(priv);
-	can_rx_offload_get_echo_skb(&priv->offload,
-					tef_tail, 0,
-					&frame_len);
+	// can_rx_offload_get_echo_skb(&priv->offload,
+	// 				tef_tail, 0,
+	// 				&frame_len);
 	netdev_info(priv->ndev, "frame len=%i tef_tail=%i, tx_tail=%i\n", frame_len, chip_tef_tail, chip_tx_tail);
 	netdev_completed_queue(priv->ndev, 1, frame_len);
 	mcp251xfd_ecc_tefif_successful(priv);
@@ -342,38 +345,52 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 			smp_mb();
 			netif_wake_queue(priv->ndev);
 		}
-	priv->tef->head = 0;
-	priv->tef->tail = 0;
+	if (priv->can.ctrlmode == CAN_CTRLMODE_PRESUME_ACK)
+	{
+		// priv->tef->head = tx_ring->head;
+		// priv->tef->tail = tx_ring->head;
 
-	tx_ring->head = 0;
-	tx_ring->tail = 0;
-
-	regmap_update_bits(priv->map_reg,
+		// tx_ring->tail = tx_ring->head;
+		regmap_update_bits(priv->map_reg,
+						MCP251XFD_REG_FIFOCON(priv->tx->fifo_nr),
+						MCP251XFD_REG_FIFOCON_TXAT_MASK | MCP251XFD_REG_FIFOCON_TXREQ,
+						FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK,
+				 		MCP251XFD_REG_FIFOCON_TXAT_UNLIMITED) | MCP251XFD_REG_FIFOCON_TXREQ);
+		regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
+    	netdev_info(priv->ndev, "WR=0x%08x-0x%08x con=0x%08x\n", MCP251XFD_REG_FIFOCON_TXAT_MASK | MCP251XFD_REG_FIFOCON_TXREQ, MCP251XFD_REG_FIFOCON_TXAT_UNLIMITED | MCP251XFD_REG_FIFOCON_TXREQ, fifocon);
+	}
+	else{
+		regmap_update_bits(priv->map_reg,
 					MCP251XFD_REG_TEFCON,
 					MCP251XFD_REG_TEFCON_FRESET,
 					MCP251XFD_REG_TEFCON_FRESET);
-	regmap_update_bits(priv->map_reg,
+		regmap_update_bits(priv->map_reg,
 					MCP251XFD_REG_FIFOCON(fifo_nr),
 					MCP251XFD_REG_FIFOCON_FRESET,
 					MCP251XFD_REG_FIFOCON_FRESET);
-	
-	do{
+		do{
 		regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
-	}while(fifocon & MCP251XFD_REG_FIFOCON_FRESET);
-	do{
-		regmap_read(priv->map_reg, MCP251XFD_REG_TEFCON, &tefcon);
-	}while(tefcon & MCP251XFD_REG_TEFCON_FRESET);
+		}while(fifocon & MCP251XFD_REG_FIFOCON_FRESET);
+		do{
+			regmap_read(priv->map_reg, MCP251XFD_REG_TEFCON, &tefcon);
+		}while(tefcon & MCP251XFD_REG_TEFCON_FRESET);
+		priv->tef->head = 0;
+		priv->tef->tail = 0;
 
-	// regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
-    // regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
+		tx_ring->head = 0;
+		tx_ring->tail = 0;
 
-    // netdev_info(priv->ndev, "END INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
+	}
 
-    // /* Dump FIFO status for all TX/RX FIFOs */
-    // regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
-	// regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
-    // netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x CON=0x%08x\n\n ", fifo_nr, fifosta, fifocon);
+	regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
+    regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
+
+    netdev_info(priv->ndev, "END INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
+
+    /* Dump FIFO status for all TX/RX FIFOs */
+    regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
+	regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
+    netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x CON=0x%08x\n\n ", fifo_nr, fifosta, fifocon);
 
     return 0;
 }
-
