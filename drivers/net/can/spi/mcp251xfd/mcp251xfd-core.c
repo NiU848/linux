@@ -963,44 +963,6 @@ static int mcp251xfd_handle_rxovif(struct mcp251xfd_priv *priv)
 	return 0;
 }
 
-static int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
-{
-	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
-	const u8 fifo_nr = tx_ring->fifo_nr;
-	int err;
-	u8 echo_idx = mcp251xfd_get_tx_tail(tx_ring);
-
-	netdev_reset_queue(priv->ndev);
-	err = regmap_update_bits(priv->map_reg,
-							MCP251XFD_REG_FIFOSTA(fifo_nr),
-							MCP251XFD_REG_FIFOSTA_TXATIF |
-							MCP251XFD_REG_FIFOSTA_TXERR |
-							MCP251XFD_REG_FIFOSTA_TXLARB |
-							MCP251XFD_REG_FIFOSTA_TXABT,
-							0);
-	if (err)
-	{
-		return err;
-	}
-
-	regmap_update_bits(priv->map_reg,
-					MCP251XFD_REG_FIFOCON(fifo_nr),
-					MCP251XFD_REG_FIFOCON_UINC,
-					MCP251XFD_REG_FIFOCON_UINC);
-
-	regmap_update_bits(priv->map_reg,
-					MCP251XFD_REG_FIFOCON(tx_ring->fifo_nr),
-					MCP251XFD_REG_FIFOCON_TXREQ, 0);
-
-	can_get_echo_skb(priv->ndev, echo_idx, NULL);
-
-	tx_ring->head = 0;
-    tx_ring->tail = 0;
-    tx_ring->nr = 0;
-
-    return 0;
-}
-
 static int mcp251xfd_handle_ivmif(struct mcp251xfd_priv *priv)
 {
 	struct net_device_stats *stats = &priv->ndev->stats;
