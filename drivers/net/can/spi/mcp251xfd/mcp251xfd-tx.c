@@ -172,8 +172,6 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 	unsigned int frame_len;
 	u8 tx_head;
 	int err;
-	u32 /*intf, fifosta, tefsta,*/ tefcon, fifocon;
-	const u8 fifo_nr = tx_ring->fifo_nr;
 
 	if (can_dev_dropped_skb(ndev, skb))
 	{
@@ -183,66 +181,31 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 	{
 		return NETDEV_TX_BUSY;
 	}
-	//netdev_info(priv->ndev, "XMIT");
-	if (priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK)
-	{
-		regmap_update_bits(priv->map_reg,
-						MCP251XFD_REG_FIFOCON(priv->tx->fifo_nr),
-						MCP251XFD_REG_FIFOCON_TXAT_MASK | MCP251XFD_REG_FIFOCON_FRESET,
-						FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK,
-				 	 		MCP251XFD_REG_FIFOCON_TXAT_ONE_SHOT) |
-						MCP251XFD_REG_FIFOCON_FRESET
-		);
-		regmap_update_bits(priv->map_reg,
-					MCP251XFD_REG_TEFCON,
-					MCP251XFD_REG_TEFCON_FRESET,
-					MCP251XFD_REG_TEFCON_FRESET);
-	
-		do{
-			regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
-		}while(fifocon & MCP251XFD_REG_FIFOCON_FRESET);
 
-		do{
-			regmap_read(priv->map_reg, MCP251XFD_REG_TEFCON, &tefcon);
-		}while(tefcon & MCP251XFD_REG_TEFCON_FRESET);
-		
-		// regmap_update_bits(priv->map_reg, MCP251XFD_REG_TEFCON,
-		// 								MCP251XFD_REG_TEFCON_TEFNEIE,
-		// 								MCP251XFD_REG_TEFCON_TEFNEIE);
-
-		priv->tef->head = 0;
-		priv->tef->tail = 0;
-
-		tx_ring->head = 0;
-		tx_ring->tail = 0;
-	}
 	tx_obj = mcp251xfd_get_tx_obj_next(tx_ring);
 	mcp251xfd_tx_obj_from_skb(priv, tx_obj, skb, tx_ring->head);
 	/* Stop queue if we occupy the complete TX FIFO */
 	tx_head = mcp251xfd_get_tx_head(tx_ring);
 	tx_ring->head++;
-	if (mcp251xfd_get_tx_free(tx_ring) == 0)
+	if (mcp251xfd_get_tx_free(tx_ring) == tx_ring->obj_num-1)
 		netif_stop_queue(ndev);
 
 	frame_len = can_skb_get_frame_len(skb);
 	
-	// netdev_info(ndev,
-	// 	"TX head=%u tail=%u free=%u frame_len=%u\n",
-	// 	tx_ring->head,
-	// 	tx_ring->tail,
-	// 	mcp251xfd_get_tx_free(tx_ring),
-	// 	frame_len);
 
 	err = can_put_echo_skb(skb, ndev, tx_head, frame_len);
 	if (!err)
 	{
 		netdev_sent_queue(priv->ndev, frame_len);
 	}
-	// regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
-    // regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
-	// regmap_read(priv->map_reg, MCP251XFD_REG_FIFOSTA(fifo_nr), &fifosta);
-    // netdev_info(priv->ndev, "After send INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
-    // netdev_info(priv->ndev, "FIFO[%d] STA=0x%08x\n", fifo_nr, fifosta);
+	//added this
+	if (READ_ONCE(priv->can.ctrlmode) & CAN_CTRLMODE_PRESUME_ACK)  {
+                /* Apply (or re-apply) mode once after open / bit change */
+                /* If you need immediate "swap-on-retransmit", request ONE_SHOT flip */
+                WRITE_ONCE(priv->pa_arm_one_shot, true);
+                schedule_work(&priv->tx_ctrl_work);
+        }
+	//-----------------
 
 	err = mcp251xfd_tx_obj_write(priv, tx_obj);
 	if (err)
@@ -254,4 +217,95 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 	netdev_err(priv->ndev, "ERROR in %s: %d\n", __func__, err);
 
 	return NETDEV_TX_OK;;
+}
+
+static int mcp251xfd_wait_clear(struct mcp251xfd_priv *priv, u32 reg, u32 mask, u32 *last)
+{
+        unsigned long timeout = jiffies + msecs_to_jiffies(20); /* 20 ms cap */
+        int ret;
+        u32 v = 0;
+
+        do {
+                ret = regmap_read(priv->map_reg, reg, &v);
+                if (ret)
+                        return ret;
+                if (!(v & mask)) {
+                        if (last) *last = v;
+                        return 0;
+                }
+                usleep_range(500, 1000);
+        } while (time_before(jiffies, timeout));
+
+        if (last) *last = v;
+        return -ETIMEDOUT;
+}
+
+static int mcp251xfd_apply_presume_ack_locked(struct mcp251xfd_priv *priv)
+{
+        int ret;
+        const u8 fifo = priv->tx->fifo_nr;
+
+        /* Program ONE_SHOT only when we want to provoke a TXATIF; otherwise default UNLIMITED.
+         * Here we default to UNLIMITED so the controller keeps retrying.
+         */
+        ret = regmap_update_bits(priv->map_reg,
+                                 MCP251XFD_REG_FIFOCON(fifo),
+                                 MCP251XFD_REG_FIFOCON_TXAT_MASK,
+                                 FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK,
+                                            MCP251XFD_REG_FIFOCON_TXAT_UNLIMITED));
+        if (ret) return ret;
+
+        ret = regmap_update_bits(priv->map_reg, MCP251XFD_REG_TEFCON,
+                                 MCP251XFD_REG_TEFCON_FRESET, MCP251XFD_REG_TEFCON_FRESET);
+        if (ret) return ret;
+
+        ret = regmap_update_bits(priv->map_reg,
+                                 MCP251XFD_REG_FIFOCON(fifo),
+                                 MCP251XFD_REG_FIFOCON_FRESET, MCP251XFD_REG_FIFOCON_FRESET);
+        if (ret) return ret;
+
+        ret = mcp251xfd_wait_clear(priv, MCP251XFD_REG_FIFOCON(fifo),
+                                   MCP251XFD_REG_FIFOCON_FRESET, NULL);
+        if (ret) return ret;
+
+        ret = mcp251xfd_wait_clear(priv, MCP251XFD_REG_TEFCON,
+                                   MCP251XFD_REG_TEFCON_FRESET, NULL);
+        if (ret) return ret;
+
+        return 0;
+}
+
+/* Sleepable worker that applies mode and optionally arms ONE_SHOT to provoke TXATIF */
+void mcp251xfd_tx_ctrl_work(struct work_struct *w)
+{
+        struct mcp251xfd_priv *priv = container_of(w, struct mcp251xfd_priv, tx_ctrl_work);
+        const u8 fifo = priv->tx->fifo_nr;
+        int ret;
+
+		if (!(READ_ONCE(priv->can.ctrlmode) & CAN_CTRLMODE_PRESUME_ACK))
+			return;
+
+        mutex_lock(&priv->conf_lock);
+
+        if (READ_ONCE(priv->pa_need_apply)) {
+                ret = mcp251xfd_apply_presume_ack_locked(priv);
+                if (!ret)
+                        WRITE_ONCE(priv->pa_need_apply, false);
+                else
+                        netdev_warn(priv->ndev, "apply PRESUME_ACK failed: %d\n", ret);
+        }
+
+        if (READ_ONCE(priv->pa_arm_one_shot)) {
+                /* Flip to ONE_SHOT once to force a TXATIF after the next attempt */
+                ret = regmap_update_bits(priv->map_reg,
+                                         MCP251XFD_REG_FIFOCON(fifo),
+                                         MCP251XFD_REG_FIFOCON_TXAT_MASK,
+                                         FIELD_PREP(MCP251XFD_REG_FIFOCON_TXAT_MASK,
+                                                    MCP251XFD_REG_FIFOCON_TXAT_ONE_SHOT));
+                if (ret)
+                        netdev_warn(priv->ndev, "arm ONE_SHOT failed: %d\n", ret);
+                WRITE_ONCE(priv->pa_arm_one_shot, false);
+        }
+
+        mutex_unlock(&priv->conf_lock);
 }
