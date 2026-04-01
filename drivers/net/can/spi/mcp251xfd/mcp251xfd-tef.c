@@ -32,6 +32,13 @@ mcp251xfd_tef_tail_get_from_chip(const struct mcp251xfd_priv *priv,
 	return 0;
 }
 
+static inline void mcp251xfd_ecc_tefif_successful(struct mcp251xfd_priv *priv)
+{
+	struct mcp251xfd_ecc *ecc = &priv->ecc;
+
+	ecc->ecc_stat = 0;
+}
+
 static int mcp251xfd_check_tef_tail(const struct mcp251xfd_priv *priv)
 {
 	u8 tef_tail_chip, tef_tail;
@@ -56,11 +63,16 @@ static int mcp251xfd_check_tef_tail(const struct mcp251xfd_priv *priv)
 }
 
 static int
-mcp251xfd_handle_tefif_recover(const struct mcp251xfd_priv *priv, const u32 seq)
+mcp251xfd_handle_tefif_recover(struct mcp251xfd_priv *priv, const u32 seq)
 {
-	const struct mcp251xfd_tx_ring *tx_ring = priv->tx;
+	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
 	u32 tef_sta;
 	int err;
+
+	if ((priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT) || (priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK))
+	{
+		netdev_err(priv->ndev, "i'm not supposed to be here\n");
+	}
 
 	err = regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tef_sta);
 	if (err)
@@ -73,13 +85,11 @@ mcp251xfd_handle_tefif_recover(const struct mcp251xfd_priv *priv, const u32 seq)
 	}
 
 	netdev_info(priv->ndev,
-		    "Transmit Event FIFO buffer %s. (seq=0x%08x, tef_tail=0x%08x, tef_head=0x%08x, tx_head=0x%08x).\n",
-		    tef_sta & MCP251XFD_REG_TEFSTA_TEFFIF ?
-		    "full" : tef_sta & MCP251XFD_REG_TEFSTA_TEFNEIF ?
-		    "not empty" : "empty",
-		    seq, priv->tef->tail, priv->tef->head, tx_ring->head);
-
-	/* The Sequence Number in the TEF doesn't match our tef_tail. */
+			"Transmit Event FIFO buffer %s. (seq=0x%08x, tef_tail=0x%08x, tef_head=0x%08x, tx_head=0x%08x).\n",
+			tef_sta & MCP251XFD_REG_TEFSTA_TEFFIF ?
+			"full" : tef_sta & MCP251XFD_REG_TEFSTA_TEFNEIF ?
+			"not empty" : "empty",
+			seq, priv->tef->tail, priv->tef->head, tx_ring->head);
 	return -EAGAIN;
 }
 
@@ -89,9 +99,34 @@ mcp251xfd_handle_tefif_one(struct mcp251xfd_priv *priv,
 			   unsigned int *frame_len_ptr)
 {
 	struct net_device_stats *stats = &priv->ndev->stats;
+	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
 	struct sk_buff *skb;
 	u32 seq, seq_masked, tef_tail_masked, tef_tail;
+	const u8 fifo = priv->tx->fifo_nr;
 
+	if(READ_ONCE(priv->tefif_enabled) == false)
+	{
+		regmap_update_bits(priv->map_reg, MCP251XFD_REG_TEFCON,
+                                 MCP251XFD_REG_TEFCON_FRESET, MCP251XFD_REG_TEFCON_FRESET);
+		regmap_update_bits(priv->map_reg,
+                                 MCP251XFD_REG_FIFOCON(fifo),
+                                 MCP251XFD_REG_FIFOCON_FRESET, MCP251XFD_REG_FIFOCON_FRESET);
+		// priv->tef->head = 0;
+		// priv->tef->tail = 0;
+		// tx_ring->head = 0;
+		// tx_ring->tail = 0;
+		tef_tail = mcp251xfd_get_tef_tail(priv);
+		skb = priv->can.echo_skb[tef_tail];
+		if (skb)
+			mcp251xfd_skb_set_timestamp(priv, skb, hw_tef_obj->ts);
+		stats->tx_bytes +=
+			can_rx_offload_get_echo_skb(&priv->offload,
+							tef_tail, hw_tef_obj->ts,
+							frame_len_ptr);
+		stats->tx_packets++;
+		priv->tef->tail++;
+		return 0;
+	}
 	seq = FIELD_GET(MCP251XFD_OBJ_FLAGS_SEQ_MCP2518FD_MASK,
 			hw_tef_obj->flags);
 
@@ -103,9 +138,10 @@ mcp251xfd_handle_tefif_one(struct mcp251xfd_priv *priv,
 		field_mask(MCP251XFD_OBJ_FLAGS_SEQ_MCP2517FD_MASK);
 	tef_tail_masked = priv->tef->tail &
 		field_mask(MCP251XFD_OBJ_FLAGS_SEQ_MCP2517FD_MASK);
-	if (seq_masked != tef_tail_masked)
+	if (seq_masked != tef_tail_masked && !(priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK) && !(priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT))
+	{
 		return mcp251xfd_handle_tefif_recover(priv, seq);
-
+	}
 	tef_tail = mcp251xfd_get_tef_tail(priv);
 	skb = priv->can.echo_skb[tef_tail];
 	if (skb)
@@ -168,13 +204,6 @@ mcp251xfd_tef_obj_read(const struct mcp251xfd_priv *priv,
 				sizeof(*hw_tef_obj) / val_bytes * len);
 }
 
-static inline void mcp251xfd_ecc_tefif_successful(struct mcp251xfd_priv *priv)
-{
-	struct mcp251xfd_ecc *ecc = &priv->ecc;
-
-	ecc->ecc_stat = 0;
-}
-
 int mcp251xfd_handle_tefif(struct mcp251xfd_priv *priv)
 {
 	struct mcp251xfd_hw_tef_obj hw_tef_obj[MCP251XFD_TX_OBJ_NUM_MAX];
@@ -189,10 +218,7 @@ int mcp251xfd_handle_tefif(struct mcp251xfd_priv *priv)
 	tef_tail = mcp251xfd_get_tef_tail(priv);
 	len = mcp251xfd_get_tef_len(priv);
 	l = mcp251xfd_get_tef_linear_len(priv);
-	// netdev_info(priv->ndev, "tef_tail:%i, len:%i, lin_len: %i\n", tef_tail, len, l);
-	// regmap_read(priv->map_reg, MCP251XFD_REG_INT, &intf);
-    // regmap_read(priv->map_reg, MCP251XFD_REG_TEFSTA, &tefsta);
-	// netdev_info(priv->ndev, "Start INTF=0x%08x TEFSTA=0x%08x\n", intf, tefsta);
+
 	err = mcp251xfd_tef_obj_read(priv, hw_tef_obj, tef_tail, l);
 	if (err)
 		return err;
@@ -220,7 +246,7 @@ int mcp251xfd_handle_tefif(struct mcp251xfd_priv *priv)
 		total_frame_len += frame_len;
 	}
 
- out_netif_wake_queue:
+out_netif_wake_queue:
 	len = i;	/* number of handled goods TEFs */
 	if (len) {
 		struct mcp251xfd_tef_ring *ring = priv->tef;
@@ -272,12 +298,14 @@ int mcp251xfd_handle_tefif(struct mcp251xfd_priv *priv)
 
 int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 {
+	u8 idx;
 	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
 	const u8 fifo = priv->tx->fifo_nr;
 	const u8 fifo_nr = tx_ring->fifo_nr;
 	int err;
-	unsigned int bytes = 0;;
-	u8 idx = mcp251xfd_get_tx_tail(tx_ring);
+	unsigned int bytes = 0;
+	idx = mcp251xfd_get_tx_tail(tx_ring);
+	u32 intf, fifosta, tefsta, fifocon, tefcon;
 
 	err = regmap_update_bits(priv->map_reg,
 							MCP251XFD_REG_FIFOSTA(fifo_nr),
@@ -290,6 +318,7 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 
 	if (priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK)
 	{
+		WRITE_ONCE(priv->presume_ack, false);
 		regmap_update_bits(priv->map_reg,
 							MCP251XFD_REG_FIFOCON(fifo_nr),
 							MCP251XFD_REG_FIFOCON_TXAT_MASK ,
@@ -301,8 +330,8 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 							MCP251XFD_REG_FIFOCON_TXREQ,
 							MCP251XFD_REG_FIFOCON_TXREQ
 		);
+		
 	}
-
 	regmap_update_bits(priv->map_reg,
 						MCP251XFD_REG_FIFOCON(fifo),
 						MCP251XFD_REG_FIFOCON_UINC,
@@ -311,13 +340,34 @@ int mcp251xfd_handle_txatif(struct mcp251xfd_priv *priv)
 
 	can_free_echo_skb(priv->ndev, idx, &bytes);  /* frees echo[idx], returns len */
 	tx_ring->tail++;
+	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
+	{
+		regmap_update_bits(priv->map_reg,
+					MCP251XFD_REG_TEFCON,
+					MCP251XFD_REG_TEFCON_FRESET,
+					MCP251XFD_REG_TEFCON_FRESET);
+		regmap_update_bits(priv->map_reg,
+					MCP251XFD_REG_FIFOCON(fifo_nr),
+					MCP251XFD_REG_FIFOCON_FRESET,
+					MCP251XFD_REG_FIFOCON_FRESET);
+		do{
+			regmap_read(priv->map_reg, MCP251XFD_REG_FIFOCON(fifo_nr), &fifocon);
+		}while(fifocon & MCP251XFD_REG_FIFOCON_FRESET);
+		do{
+			regmap_read(priv->map_reg, MCP251XFD_REG_TEFCON, &tefcon);
+		}while(tefcon & MCP251XFD_REG_TEFCON_FRESET);
+		priv->tef->head = 0;
+		priv->tef->tail = 0;
+		tx_ring->head = 0;
+		tx_ring->tail = 0;
+	}
 	netdev_completed_queue(priv->ndev, 1, bytes);
 	mcp251xfd_ecc_tefif_successful(priv);
-	
 	if (mcp251xfd_get_tx_free(tx_ring)) {
 		smp_mb();
 		netif_wake_queue(priv->ndev);
 	}
+	WRITE_ONCE(priv->tefif_enabled, false);
 
     return 0;
 }

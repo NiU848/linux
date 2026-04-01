@@ -68,7 +68,8 @@ mcp251xfd_tx_obj_from_skb(const struct mcp251xfd_priv *priv,
 
 	/* CANFD */
 	if (can_is_canfd_skb(skb)) {
-		if (cfd->flags & CANFD_ESI)
+		if (cfd->flags & CANFD_ESI &&
+		    !(priv->can.ctrlmode & CAN_CTRLMODE_PRESUME_ACK))
 			flags |= MCP251XFD_OBJ_FLAGS_ESI;
 
 		flags |= MCP251XFD_OBJ_FLAGS_FDF;
@@ -131,6 +132,38 @@ mcp251xfd_tx_obj_from_skb(const struct mcp251xfd_priv *priv,
 	tx_obj->xfer[0].len = len;
 }
 
+static void mcp251xfd_tx_failure_drop(const struct mcp251xfd_priv *priv,
+				      struct mcp251xfd_tx_ring *tx_ring,
+				      int err)
+{
+	struct net_device *ndev = priv->ndev;
+	struct net_device_stats *stats = &ndev->stats;
+	unsigned int frame_len = 0;
+	u8 tx_head;
+
+	tx_ring->head--;
+	stats->tx_dropped++;
+	tx_head = mcp251xfd_get_tx_head(tx_ring);
+	can_free_echo_skb(ndev, tx_head, &frame_len);
+	netdev_completed_queue(ndev, 1, frame_len);
+	netif_wake_queue(ndev);
+
+	if (net_ratelimit())
+		netdev_err(priv->ndev, "ERROR in %s: %d\n", __func__, err);
+}
+
+void mcp251xfd_tx_obj_write_sync(struct work_struct *work)
+{
+	struct mcp251xfd_priv *priv = container_of(work, struct mcp251xfd_priv,
+						   tx_work);
+	struct mcp251xfd_tx_obj *tx_obj = priv->tx_work_obj;
+	struct mcp251xfd_tx_ring *tx_ring = priv->tx;
+	int err;
+
+	err = spi_sync(priv->spi, &tx_obj->msg);
+	if (err)
+		mcp251xfd_tx_failure_drop(priv, tx_ring, err);
+}
 
 static int mcp251xfd_tx_obj_write(const struct mcp251xfd_priv *priv,
 				  struct mcp251xfd_tx_obj *tx_obj)
@@ -163,6 +196,11 @@ static bool mcp251xfd_tx_busy(const struct mcp251xfd_priv *priv,
 	return false;
 }
 
+static bool mcp251xfd_work_busy(struct work_struct *work)
+{
+	return work_busy(work);
+}
+
 netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 				 struct net_device *ndev)
 {
@@ -172,12 +210,13 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 	unsigned int frame_len;
 	u8 tx_head;
 	int err;
-
+	
 	if (can_dev_dropped_skb(ndev, skb))
 	{
 		return NETDEV_TX_OK;
 	}
-	if (mcp251xfd_tx_busy(priv, tx_ring))
+	if (mcp251xfd_tx_busy(priv, tx_ring) ||
+	    mcp251xfd_work_busy(&priv->tx_work))// added this
 	{
 		return NETDEV_TX_BUSY;
 	}
@@ -199,22 +238,28 @@ netdev_tx_t mcp251xfd_start_xmit(struct sk_buff *skb,
 		netdev_sent_queue(priv->ndev, frame_len);
 	}
 	//added this
-	if (READ_ONCE(priv->can.ctrlmode) & CAN_CTRLMODE_PRESUME_ACK)  {
-                /* Apply (or re-apply) mode once after open / bit change */
-                /* If you need immediate "swap-on-retransmit", request ONE_SHOT flip */
-                WRITE_ONCE(priv->pa_arm_one_shot, true);
-                schedule_work(&priv->tx_ctrl_work);
-        }
+	
+	if (READ_ONCE(priv->can.ctrlmode) & CAN_CTRLMODE_PRESUME_ACK) 
+	{
+		WRITE_ONCE(priv->tefif_enabled, true);
+		if (xchg(&priv->pa_arm_one_shot, true) == false)   // set only if it was false
+			schedule_work(&priv->tx_ctrl_work);
+	}
+	else if (READ_ONCE(priv->can.ctrlmode) & CAN_CTRLMODE_ONE_SHOT)
+	{
+		WRITE_ONCE(priv->tefif_enabled, true);
+	}
+
 	//-----------------
 
 	err = mcp251xfd_tx_obj_write(priv, tx_obj);
-	if (err)
-		goto out_err;
-
-	return NETDEV_TX_OK;
-
- out_err:
-	netdev_err(priv->ndev, "ERROR in %s: %d\n", __func__, err);
+	if (err == -EBUSY) {
+		netif_stop_queue(ndev);
+		priv->tx_work_obj = tx_obj;
+		queue_work(priv->wq, &priv->tx_work);
+	} else if (err) {
+		mcp251xfd_tx_failure_drop(priv, tx_ring, err);
+	}
 
 	return NETDEV_TX_OK;;
 }
@@ -240,7 +285,7 @@ static int mcp251xfd_wait_clear(struct mcp251xfd_priv *priv, u32 reg, u32 mask, 
         return -ETIMEDOUT;
 }
 
-static int mcp251xfd_apply_presume_ack_locked(struct mcp251xfd_priv *priv)
+int mcp251xfd_apply_presume_ack_locked(struct mcp251xfd_priv *priv)
 {
         int ret;
         const u8 fifo = priv->tx->fifo_nr;
